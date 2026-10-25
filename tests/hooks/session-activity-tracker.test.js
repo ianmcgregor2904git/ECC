@@ -407,6 +407,69 @@ function runTests() {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }) ? passed++ : failed++);
 
+  const passwordPersistencePassed = test('does not persist any part of quoted password values from Claude tool responses', () => {
+    for (const [name, toolResponse] of [
+      ['string', 'DB_PASSWORD="first second"\n'],
+      ['Bash stdout', { stdout: "DB_PASSWORD='third fourth'\n", stderr: '' }],
+    ]) {
+      const tmpHome = makeTempDir();
+      try {
+        const result = runScript({
+          hook_event_name: 'PostToolUse',
+          session_id: 'redaction-test',
+          tool_name: name === 'Bash stdout' ? 'Bash' : 'Read',
+          tool_input: name === 'Bash stdout' ? { command: 'printf safe' } : { file_path: 'README.md' },
+          tool_response: toolResponse,
+        }, withTempHome(tmpHome));
+        assert.strictEqual(result.code, 0, name);
+        const metrics = fs.readFileSync(path.join(tmpHome, '.claude', 'metrics', 'tool-usage.jsonl'), 'utf8');
+        const row = JSON.parse(metrics.trim());
+        assert.match(row.output_summary, /DB_password=<REDACTED>/i, name);
+        for (const fragment of ['first', 'second', 'third', 'fourth']) {
+          assert.ok(!metrics.includes(fragment), `${name} persisted password fragment ${fragment}`);
+        }
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    }
+  });
+  passed += Number(passwordPersistencePassed);
+  failed += Number(!passwordPersistencePassed);
+
+  const legacyCredentialPersistencePassed = test('does not persist quoted token or Authorization header suffixes', () => {
+    for (const [name, stdout, fragments] of [
+      ['quoted token option', '--token="fifth sixth"', ['fifth', 'sixth']],
+      ['spaced token option', '--token "seventh eighth"', ['seventh', 'eighth']],
+      ['quoted Authorization header', 'Authorization: Bearer "ninth tenth"\nstatus=ok', ['ninth', 'tenth']],
+      ['bare Authorization header', 'Authorization: Bearer eleventh twelfth\nstatus=ok', ['eleventh', 'twelfth']],
+      ['spaced password label', 'password "thirteenth fourteenth"', ['thirteenth', 'fourteenth']],
+      ['quoted API key assignment', 'API_KEY="fifteenth sixteenth"', ['fifteenth', 'sixteenth']],
+    ]) {
+      const tmpHome = makeTempDir();
+      try {
+        const result = runScript({
+          hook_event_name: 'PostToolUse',
+          session_id: 'redaction-test',
+          tool_name: 'Bash',
+          tool_input: { command: 'printf safe' },
+          tool_response: { stdout, stderr: '' },
+        }, withTempHome(tmpHome));
+        assert.strictEqual(result.code, 0, name);
+        const metrics = fs.readFileSync(path.join(tmpHome, '.claude', 'metrics', 'tool-usage.jsonl'), 'utf8');
+        const row = JSON.parse(metrics.trim());
+        assert.ok(row.output_summary.includes('<REDACTED>'), name);
+        for (const fragment of fragments) {
+          assert.ok(!metrics.includes(fragment), `${name} persisted credential fragment ${fragment}`);
+        }
+        if (name.includes('Authorization')) assert.ok(row.output_summary.includes('status=ok'), name);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    }
+  });
+  passed += Number(legacyCredentialPersistencePassed);
+  failed += Number(!legacyCredentialPersistencePassed);
+
   (test('reads session_id from stdin JSON when no session env var is set', () => {
     // Claude Code does not set CLAUDE_SESSION_ID for hook subprocesses in
     // real invocations -- the session id only arrives via stdin JSON.
@@ -498,6 +561,51 @@ function runTests() {
     assert.strictEqual(summarizeOutput(undefined), '');
     assert.strictEqual(summarizeOutput('hello\nworld'), 'hello world');
     assert.strictEqual(summarizeOutput({ ok: true }), '{"ok":true}');
+    // Claude Code sends the result as tool_response, for Bash { stdout, stderr, ... }.
+    assert.strictEqual(summarizeOutput({ stdout: `token ghp_${'A'.repeat(20)}`, stderr: '' }), 'token <REDACTED>');
+    const bashRow = buildActivityRow(
+      {
+        hook_event_name: 'PostToolUse',
+        session_id: 'sess-1',
+        tool_name: 'Bash',
+        tool_input: { command: 'npm test' },
+        tool_response: { stdout: '12 passing\n', stderr: 'warn: slow\n', interrupted: false, isImage: false },
+      },
+      {}
+    );
+    assert.strictEqual(bashRow.output_summary, '12 passing warn: slow');
+    // Output such as `cat .env` lands here too, so the secrets governance-capture
+    // detects are redacted as well.
+    assert.strictEqual(summarizeOutput({ stdout: 'api_key = "example-secret-value"\n', stderr: '' }), 'api_key = <REDACTED>');
+    assert.strictEqual(summarizeOutput('OPENAI_API_KEY=sk-abc123def456\nDEBUG=1'), 'OPENAI_API_KEY=<REDACTED> DEBUG=1');
+    assert.strictEqual(summarizeOutput('AWS_SECRET_ACCESS_KEY=example-secret-value'), 'AWS_SECRET_ACCESS_KEY=<REDACTED>');
+    assert.strictEqual(summarizeOutput('DOCKER_AUTH_CONFIG={"auths":{"registry":{}}}'), 'DOCKER_AUTH_CONFIG=<REDACTED>');
+    assert.strictEqual(summarizeOutput('DOCKER_AUTH_CONFIG={"auths": {"registry": {"auth": "dXNlcjpwYXNz"}}}'), 'DOCKER_AUTH_CONFIG=<REDACTED>');
+    assert.strictEqual(summarizeOutput('{"auths":{"registry":{"auth":"dXNlcjpwYXNz"}}}'), '{"auths":{"registry":{"auth":<REDACTED>}}}');
+    assert.strictEqual(summarizeOutput('auth_method=oidc author=Jane'), 'auth_method=oidc author=Jane');
+    assert.strictEqual(summarizeOutput('{"token": "abc.def", "user": "bob"}'), '{"token": <REDACTED>, "user": "bob"}');
+    const jwt = ['eyJ' + 'a'.repeat(12), 'eyJ' + 'b'.repeat(12), 'c'.repeat(12)].join('.');
+    assert.strictEqual(summarizeOutput(`Bearer ${jwt} done`), 'Bearer <REDACTED> done');
+    assert.strictEqual(summarizeOutput('-----BEGIN RSA PRIVATE KEY-----\nMIIE...'), '<REDACTED>');
+    assert.strictEqual(summarizeOutput(`ghu_${'C'.repeat(36)}`), '<REDACTED>');
+    assert.strictEqual(summarizeOutput('Unexpected tokens: 0, max_tokens=4096, tokenizer=bpe, author=Jane'), 'Unexpected tokens: 0, max_tokens=4096, tokenizer=bpe, author=Jane');
+    // A bare value after a quoted JSON key ends at the next field, and a quoted one
+    // may hold escaped quotes.
+    assert.strictEqual(summarizeOutput('{"token":null,"status":"failed","exit_code":1}'), '{"token":<REDACTED>,"status":"failed","exit_code":1}');
+    assert.strictEqual(summarizeOutput('{"api_key":"part1\\" part2"}'), '{"api_key":<REDACTED>}');
+    // Any other bare value runs to the next space: a comma can be part of it.
+    assert.strictEqual(summarizeOutput('CLIENT_SECRET=alpha,beta DEBUG=1'), 'CLIENT_SECRET=<REDACTED> DEBUG=1');
+    assert.strictEqual(summarizeOutput('client_secret: alpha,beta'), 'client_secret: <REDACTED>');
+    // The whole name is checked, however long.
+    const longName = `API_KEY_${'A'.repeat(65)}`;
+    assert.strictEqual(summarizeOutput(`${longName}=example-secret-value`), `${longName}=<REDACTED>`);
+    assert.strictEqual(summarizeOutput(`${'A'.repeat(100)}_SECRET=example-secret-value`), `${'A'.repeat(100)}_SECRET=<REDACTED>`);
+    // Separator-heavy output stays linear: unbounded name parts took seconds here.
+    for (const output of ['a.'.repeat(64000), 'secret'.repeat(21000), 'x.secret:'.repeat(14000), '"a":'.repeat(32000)]) {
+      const started = Date.now();
+      summarizeOutput(output);
+      assert.ok(Date.now() - started < 2000, `Redacting ${output.length} characters should stay within its time budget`);
+    }
   }) ? passed++ : failed++);
 
   (test('extracts file paths from nested arrays while filtering duplicates and remote URIs', () => {
